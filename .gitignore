@@ -1,0 +1,7 @@
+data/
+*.parquet
+tinystories-*
+__pycache__/
+*.pyc
+.cache/
+.venv/
