@@ -196,12 +196,10 @@ def run_training(
     # 4. Training Arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
-        overwrite_output_dir=True,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=grad_accum,
         learning_rate=learning_rate,
-        min_lr_ratio=0.1,
         lr_scheduler_type="cosine",
         warmup_steps=min(500, max(5, steps // 10)),
         max_steps=steps,
