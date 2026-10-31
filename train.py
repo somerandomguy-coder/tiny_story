@@ -9,8 +9,10 @@ from transformers import (
     LlamaConfig,
     LlamaForCausalLM,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 def get_device():
     """Detect available accelerator."""
@@ -40,7 +42,7 @@ def get_dataset(
     data_dir: str = "./data",
     test_mode: bool = False,
     max_train_samples: int = 200_000,
-    max_val_samples: int = 5_000,
+    max_val_samples: int = 500,
 ):
     """
     Load dataset from local parquet files if present, else download from Hugging Face.
@@ -82,7 +84,7 @@ def tokenize_dataset(
     train_dataset,
     val_dataset,
     tokenizer,
-    max_length: int = 512,
+    max_length: int = 256,
     num_proc: int = 0,
 ):
     """Tokenize train and validation datasets with padding/truncation."""
@@ -135,15 +137,37 @@ def generate_story(
         )
     return tokenizer.decode(output[0], skip_special_tokens=True)
 
+class SaveTokenizerAndSampleCallback(TrainerCallback):
+    """Callback to save tokenizer into each checkpoint folder and display live sample."""
+    def __init__(self, tokenizer, sample_prompt: str = "Once upon a time, there was a little"):
+        self.tokenizer = tokenizer
+        self.sample_prompt = sample_prompt
+
+    def on_save(self, args, state, control, model=None, **kwargs):
+        checkpoint_folder = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if os.path.isdir(checkpoint_folder):
+            self.tokenizer.save_pretrained(checkpoint_folder)
+        
+        if model is not None:
+            print(f"\n--- [Checkpoint at Step {state.global_step}] Live Story Sample ---")
+            story = generate_story(model, self.tokenizer, prompt=self.sample_prompt, max_new_tokens=60)
+            print(f"{story}\n---------------------------------------------------------------\n")
+
 def run_training(
     output_dir: str = "./tinystories-checkpoints",
     final_dir: str = "./tinystories-final",
     test_run: bool = False,
-    max_steps: int = 10_000,
+    max_steps: int = 1_000,
+    save_steps: int = 100,
+    eval_steps: int = 100,
+    logging_steps: int = 20,
+    save_total_limit: int = 3,
     batch_size: int = 32,
     grad_accum: int = 2,
+    max_length: int = 256,
     learning_rate: float = 5e-4,
     data_dir: str = "./data",
+    resume: bool = False,
 ):
     """Main training routine."""
     torch.manual_seed(42)
@@ -161,30 +185,30 @@ def run_training(
     
     # 2. Model
     model = build_model(vocab_size=len(tokenizer))
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in set(model.parameters()) if p.requires_grad)
     print(f"Initialized LLaMA model from scratch with {total_params / 1e6:.2f}M trainable parameters.")
     
-    # 3. Data
+    # 3. Data configuration
     if test_run:
         output_dir = "./tinystories-test-checkpoints"
         final_dir = "./tinystories-test-final"
         steps = 50
-        eval_steps = 25
-        save_steps = 50
-        logging_steps = 10
+        eval_steps_val = 25
+        save_steps_val = 50
+        logging_steps_val = 10
         train_ds, val_ds = get_dataset(data_dir=data_dir, test_mode=True)
     else:
         steps = max_steps
-        eval_steps = 1_000
-        save_steps = 2_500
-        logging_steps = 100
-        train_ds, val_ds = get_dataset(data_dir=data_dir, test_mode=False)
+        eval_steps_val = eval_steps
+        save_steps_val = save_steps
+        logging_steps_val = logging_steps
+        train_ds, val_ds = get_dataset(data_dir=data_dir, test_mode=False, max_val_samples=500)
         
     tokenized_train, tokenized_val = tokenize_dataset(
         train_ds,
         val_ds,
         tokenizer,
-        max_length=512,
+        max_length=max_length,
         num_proc=0,  # Safe on Windows without multiprocess fork issues
     )
     
@@ -203,11 +227,11 @@ def run_training(
         lr_scheduler_type="cosine",
         warmup_steps=min(500, max(5, steps // 10)),
         max_steps=steps,
-        logging_steps=logging_steps,
+        logging_steps=logging_steps_val,
         eval_strategy="steps",
-        eval_steps=eval_steps,
-        save_steps=save_steps,
-        save_total_limit=2,
+        eval_steps=eval_steps_val,
+        save_steps=save_steps_val,
+        save_total_limit=save_total_limit,
         bf16=use_bf16,
         fp16=not use_bf16 and use_cuda,
         dataloader_num_workers=0,  # Direct and safe for Windows
@@ -216,40 +240,59 @@ def run_training(
         report_to="none",
     )
     
-    # 5. Trainer
+    # 5. Trainer with Auto Tokenizer Saving & Sampling Callback
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_train,
         eval_dataset=tokenized_val,
         data_collator=data_collator,
+        callbacks=[SaveTokenizerAndSampleCallback(tokenizer)],
     )
     
-    print(f"\nBeginning training ({steps} steps)...")
-    trainer.train()
+    # 6. Checkpoint Resume Handling
+    resume_checkpoint = None
+    if resume:
+        last_ckpt = get_last_checkpoint(output_dir)
+        if last_ckpt is not None:
+            print(f"Resuming training from checkpoint: {last_ckpt}")
+            resume_checkpoint = last_ckpt
+        else:
+            print(f"No previous checkpoint found in '{output_dir}'. Starting fresh training.")
     
-    # 6. Save Model
+    print(f"\nBeginning training ({steps} steps, checkpoint every {save_steps_val} steps)...")
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
+    
+    # 7. Save Final Model
     print(f"\nSaving final model and tokenizer to {final_dir}...")
     trainer.save_model(final_dir)
     tokenizer.save_pretrained(final_dir)
     print(f"Model saved successfully to {final_dir}")
     
-    # 7. Generation Sanity Check
-    print("\n--- Model Output Generation Test ---")
+    # 8. Final Generation Test
+    print("\n--- Final Model Output Generation Test ---")
     sample_prompt = "Once upon a time, there was a little dog named Spot who loved to"
-    story = generate_story(model, tokenizer, prompt=sample_prompt, max_new_tokens=100)
+    story = generate_story(model, tokenizer, prompt=sample_prompt, max_new_tokens=120)
     print(f"Generated Story:\n{story}\n")
     return final_dir
 
 def main():
     parser = argparse.ArgumentParser(description="TinyStories Training and Generation Pipeline")
     parser.add_argument("--test-run", action="store_true", help="Run quick 50-step end-to-end verification")
-    parser.add_argument("--train", action="store_true", help="Run full training")
+    parser.add_argument("--train", action="store_true", help="Run training")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output directory")
     parser.add_argument("--generate", action="store_true", help="Generate story from checkpoint")
     parser.add_argument("--checkpoint-dir", type=str, default="./tinystories-final", help="Path to checkpoint directory for generation")
+    parser.add_argument("--output-dir", type=str, default="./tinystories-checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--final-dir", type=str, default="./tinystories-final", help="Directory to save final model")
     parser.add_argument("--prompt", type=str, default="Once upon a time, there was a little dog named Spot who loved to", help="Prompt for generation")
-    parser.add_argument("--max-steps", type=int, default=10_000, help="Max steps for training")
-    parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size")
+    parser.add_argument("--max-steps", type=int, default=1_000, help="Max steps for training (default: 1000, ~15 mins)")
+    parser.add_argument("--save-steps", type=int, default=100, help="Save a checkpoint every X steps (default: 100)")
+    parser.add_argument("--eval-steps", type=int, default=100, help="Evaluate every X steps (default: 100)")
+    parser.add_argument("--logging-steps", type=int, default=20, help="Log loss every X steps (default: 20)")
+    parser.add_argument("--save-total-limit", type=int, default=3, help="Max checkpoints to keep on disk (default: 3)")
+    parser.add_argument("--batch-size", type=int, default=32, help="Per-device batch size (default: 32)")
+    parser.add_argument("--max-length", type=int, default=256, help="Max sequence length (default: 256 for fast training)")
     parser.add_argument("--data-dir", type=str, default="./data", help="Directory containing parquet files")
     
     args = parser.parse_args()
@@ -266,15 +309,23 @@ def main():
         print(f"\nPrompt: {args.prompt}")
         story = generate_story(model, tokenizer, prompt=args.prompt, max_new_tokens=120)
         print(f"\nResult:\n{story}\n")
-    elif args.test_run:
-        run_training(test_run=True, batch_size=args.batch_size, data_dir=args.data_dir)
     elif args.train:
         run_training(
             test_run=False,
             max_steps=args.max_steps,
+            save_steps=args.save_steps,
+            eval_steps=args.eval_steps,
+            logging_steps=args.logging_steps,
+            save_total_limit=args.save_total_limit,
             batch_size=args.batch_size,
+            max_length=args.max_length,
+            output_dir=args.output_dir,
+            final_dir=args.final_dir,
             data_dir=args.data_dir,
+            resume=args.resume,
         )
+    elif args.test_run:
+        run_training(test_run=True, batch_size=args.batch_size, data_dir=args.data_dir)
     else:
         # Default behavior: run test-run if no arguments provided
         print("No specific mode specified. Running quick --test-run (50 steps) to verify pipeline...")
