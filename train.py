@@ -253,12 +253,25 @@ def run_training(
     # 6. Checkpoint Resume Handling
     resume_checkpoint = None
     if resume:
-        last_ckpt = get_last_checkpoint(output_dir)
-        if last_ckpt is not None:
-            print(f"Resuming training from checkpoint: {last_ckpt}")
-            resume_checkpoint = last_ckpt
+        if isinstance(resume, str) and os.path.exists(resume):
+            print(f"Resuming training from specified checkpoint: {resume}")
+            resume_checkpoint = resume
         else:
-            print(f"No previous checkpoint found in '{output_dir}'. Starting fresh training.")
+            last_ckpt = get_last_checkpoint(output_dir)
+            if last_ckpt is not None:
+                print(f"Resuming training from latest checkpoint: {last_ckpt}")
+                resume_checkpoint = last_ckpt
+            else:
+                print(f"No previous checkpoint found in '{output_dir}'. Starting fresh training.")
+
+    if resume_checkpoint is not None:
+        try:
+            ckpt_step = int(os.path.basename(os.path.normpath(resume_checkpoint)).split("-")[-1])
+            if steps <= ckpt_step:
+                print(f"\n[ATTENTION] Checkpoint '{resume_checkpoint}' is already at step {ckpt_step}!")
+                print(f"Current --max-steps is {steps}. To train further beyond step {ckpt_step}, set --max-steps to a higher number (e.g. --max-steps {ckpt_step + 500} or {ckpt_step + 1000}).\n")
+        except Exception:
+            pass
     
     print(f"\nBeginning training ({steps} steps, checkpoint every {save_steps_val} steps)...")
     trainer.train(resume_from_checkpoint=resume_checkpoint)
@@ -280,7 +293,7 @@ def main():
     parser = argparse.ArgumentParser(description="TinyStories Training and Generation Pipeline")
     parser.add_argument("--test-run", action="store_true", help="Run quick 50-step end-to-end verification")
     parser.add_argument("--train", action="store_true", help="Run training")
-    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output directory")
+    parser.add_argument("--resume", nargs="?", const=True, default=False, help="Resume training (auto-detects latest checkpoint, or specify path)")
     parser.add_argument("--generate", action="store_true", help="Generate story from checkpoint")
     parser.add_argument("--checkpoint-dir", type=str, default="./tinystories-final", help="Path to checkpoint directory for generation")
     parser.add_argument("--output-dir", type=str, default="./tinystories-checkpoints", help="Directory to save checkpoints")
